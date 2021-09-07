@@ -1,5 +1,7 @@
 import { Construct } from "constructs"; 
-import { aws_iam as iam, aws_certificatemanager as certificatemanager, aws_route53 as route53, aws_elasticloadbalancingv2 as elbv2, aws_elasticloadbalancingv2_targets as targets, aws_ec2 as ec2, aws_ecs as ecs, aws_efs as efs, Stack, StackProps, RemovalPolicy } from 'aws-cdk-lib';
+import { Duration, aws_iam as iam, aws_rds as rds, aws_secretsmanager as secretsmanager, aws_certificatemanager as certificatemanager, aws_route53 as route53, aws_elasticloadbalancingv2 as elbv2, aws_elasticloadbalancingv2_targets as targets, aws_ec2 as ec2, aws_ecs as ecs, aws_efs as efs, Stack, StackProps, RemovalPolicy } from 'aws-cdk-lib';
+import { FargateService } from "aws-cdk-lib/lib/aws-ecs";
+import { FargateCluster } from "aws-cdk-lib/lib/aws-eks";
 
 
 export interface CdkWordPressStackProps extends StackProps {
@@ -23,25 +25,26 @@ export class AwsCdkWordpressStack extends Stack {
     - Security Group
     */
 
-    // Create VPC (/23)
+    // Create VPC (/24)
     const vpc=new ec2.Vpc(this,"wordpressVpc",{
-    cidr: '192.168.0.0/23',
+    cidr: '192.168.0.0/24',
     maxAzs: 2,
    
     subnetConfiguration: [
+      {
+        name: 'Application',
+        cidrMask: 26,
+        subnetType: ec2.SubnetType.ISOLATED,
+        
+        
+        },
+  
     {
     name: 'Public',
     cidrMask: 27,
     subnetType: ec2.SubnetType.PUBLIC
     
     },
-    {
-      name: 'Application',
-      cidrMask: 26,
-      subnetType: ec2.SubnetType.PRIVATE,
-      
-      
-      },
       {
         name: 'Data',
         cidrMask: 28,
@@ -54,10 +57,52 @@ export class AwsCdkWordpressStack extends Stack {
     
     });
 
-   
+    //#########################################################################
+    //# Section: VPC Endpoints                                                #
+    //#
+    //# Using ECR without NAT Gateway requires 3 Endpoints configured (2 Interface Endpoints and 1 Gateway Endpoint)
+    //#########################################################################
+
+    const appsubnets = vpc.selectSubnets({
+      subnetGroupName:  "Application",
+      onePerAz: true,
+    });
+
+    // Adding interface endpoints for ECR Api
+    const ecrIE = vpc.addInterfaceEndpoint('ECR', {
+      service: ec2.InterfaceVpcEndpointAwsService.ECR,
+      privateDnsEnabled: true,
+      subnets: appsubnets,
+    });
+    ecrIE.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(443), 'Allow from ECR IE Private SG');
+
+// Adding interface endpoints for ECR Docker (Required for Fargate 1.4.0 or later)
+    const ecrdkrIE = vpc.addInterfaceEndpoint('ECR-Docker', {
+      service: ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
+      privateDnsEnabled: true,
+      subnets: appsubnets,
+    });
+    ecrdkrIE.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(443), 'Allow from ECR IE Private SG');
     
 
+    vpc.addGatewayEndpoint('S3-GWEndpoint', {
+      service: ec2.GatewayVpcEndpointAwsService.S3,
+      subnets: [appsubnets],
+    });
+    
 
+    //Enable Cloudwatch Flow Logs to Cloudwatch Logs (Best Practice for VPC)
+    const CloudWatchflowLog = new ec2.FlowLog(this, "flowlog-to-cloudwatch", {
+      resourceType: ec2.FlowLogResourceType.fromVpc(vpc),
+    })
+
+    CloudWatchflowLog.node.children.forEach(c => {
+      let fl = c.node.defaultChild as ec2.CfnFlowLog
+      if (fl) {
+        fl.logGroupName = "/aws/vpc/" + vpc.vpcId + "/"
+      }
+    });
+    
 
 
     //Create an Application Load Balancer for use with the Container
@@ -149,18 +194,30 @@ export class AwsCdkWordpressStack extends Stack {
    });
 
    
+   //EFS Security Group
    const efssg=new ec2.SecurityGroup(this, "efs-securitygroup",{
     vpc: vpc,
     allowAllOutbound: false
 
   });
 
+  //Fargate Security Group
   const fargatesg=new ec2.SecurityGroup(this, "ecs-securitygroup",{
     vpc: vpc,
     allowAllOutbound: true
     
 
   });
+
+  //RDS Security Group 
+  const dbSecurityGroup = new ec2.SecurityGroup(this,"securitygroupforDB", {
+    allowAllOutbound: false,
+    vpc: vpc
+  });
+
+  dbSecurityGroup.connections.allowFrom(fargatesg,ec2.Port.tcp(3306), 'Allow MySQL access from Fargate Service');
+  efssg.connections.allowFrom(fargatesg, ec2.Port.tcp(2049), 'allow EFS connectivity from Fargate')
+  
 
   //Allow Load Balancer to communicate with Fargate Container
   fargatesg.connections.allowFrom(lb, ec2.Port.tcp(8080), 'Allow from Load Balancer to ECS');
@@ -190,6 +247,34 @@ export class AwsCdkWordpressStack extends Stack {
     }
 
 
+    /*Create Aurora Serverless environment
+    */
+
+  // Default secret
+  const dbpassword = new secretsmanager.Secret(this, 'dbpassword',{
+    secretName: 'auroraSecret',
+    
+    generateSecretString: {
+      excludePunctuation: true,
+      includeSpace: false,
+      secretStringTemplate: JSON.stringify({ username: 'wordpressadmin' }),
+      generateStringKey: 'password'
+    }
+
+  }
+  );
+  
+
+    const auroraDatabaseCluster = new rds.ServerlessCluster(this, 'Database', {
+      engine: rds.DatabaseClusterEngine.AURORA_MYSQL,
+      credentials: rds.Credentials.fromSecret(dbpassword),
+      parameterGroup:  rds.ParameterGroup.fromParameterGroupName(this, 'ParameterGroup', 'default.aurora-mysql5.7'),
+      defaultDatabaseName: 'wordpress',
+      vpc: vpc,
+      securityGroups: [dbSecurityGroup],
+      //storageEncryptionKey: databaseKey,
+      deletionProtection: false
+    });
 
     /*Create Fargate Service, Task and components
     */
@@ -239,6 +324,11 @@ export class AwsCdkWordpressStack extends Stack {
           );
     //Create Fargate Environment (ECS Cluster, Definitions, Service, etc.)
 
+   
+  
+    
+    
+
     const fargatetask=new ecs.FargateTaskDefinition(this, "fargatetask", {
     
     family: "wordpress",   
@@ -246,29 +336,53 @@ export class AwsCdkWordpressStack extends Stack {
     cpu: 256,
     taskRole: taskRole,
     executionRole: taskRole,
-
-
     volumes: [{
       efsVolumeConfiguration: {
         fileSystemId: efsvolume.fileSystemId,
-        rootDirectory: '/bitnami/wordpress'
+        transitEncryption: 'ENABLED',
         
       },
+      
       name: 'wordpress-data'
       
-    }]
+    }],
+    
    
 
     
     });
 
+    
     fargatetask.addContainer('wordpress', {
       image: ecs.ContainerImage.fromRegistry("bitnami/wordpress"),
       memoryLimitMiB:512,
       portMappings: [{
-        containerPort: 80,
+        containerPort: 8080,
         protocol: ecs.Protocol.TCP
       }],
+      
+      logging:  ecs.LogDrivers.awsLogs ({ streamPrefix: 'WordPressLogs' }),
+      environment: {
+        
+          //Environment variables pass from Aurora Deployment
+          MARIADB_HOST: auroraDatabaseCluster.clusterEndpoint.hostname,
+          WORDPRESS_DATABASE_USER: "wordpressadmin",
+          WORDPRESS_DATABASE_NAME: 'wordpress',
+          PHP_MEMORY_LIMIT: "512M",
+          enabled: "false",
+          ALLOW_EMPTY_PASSWORD:"yes"
+      },
+      
+
+      secrets: {
+        WORDPRESS_DATABASE_PASSWORD: ecs.Secret.fromSecretsManager(dbpassword, 'password')
+
+      },
+  
+      
+
+
+    
       
 
     });

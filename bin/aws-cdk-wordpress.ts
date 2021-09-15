@@ -9,10 +9,11 @@ new AwsCdkWordpressStack(app, 'AwsCdkWordpressStack', {
   //env: { 
   //  account: '123456789012', region: 'ap-southeast-2' 
   //},
-  //route53domain: ,
-  //SetRoute53RootURL: ,
-  //wordpressFQDN: ,
-  //VpcCidr: 
+  //route53domain: '',
+  //SetRoute53RootURL: true,
+  //wordpressFQDN: '',
+  //VpcCidr: '',
+ // privateECR: '',
 
 
   /* For more information, see https://docs.aws.amazon.com/cdk/latest/guide/environments.html */

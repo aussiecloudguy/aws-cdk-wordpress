@@ -20,7 +20,7 @@ export interface CdkWordPressStackProps extends StackProps {
   readonly route53domain?: string; //Route 53 Hosted Domain (Optional). If specified ACM will use for Certificate and create HTTPS listener for Load Balancer
   readonly wordpressFQDN?: string;
   readonly SetRoute53RootURL?: boolean; //Automatically create Alias Record for root DNS and CNAME for WWW on zone
-
+  readonly privateECR?: string; //Private ECR Repository. If configured the VPC will not include NAT Gateways but instead use Private ECR from within the account
 }
 
 export class AwsCdkWordpressStack extends Stack {
@@ -40,8 +40,13 @@ export class AwsCdkWordpressStack extends Stack {
       
     }
 
+    let vpc: ec2.Vpc;
+    if (props?.privateECR === undefined) {
+
+    
+
     // Create VPC (/24)
-    const vpc=new ec2.Vpc(this,"wordpressVpc",{
+    vpc=new ec2.Vpc(this,"wordpressVpc",{
     cidr: vpcCidr,
     maxAzs: 2,
    
@@ -73,6 +78,67 @@ export class AwsCdkWordpressStack extends Stack {
     
     });
 
+  } else {
+
+    
+    // Create VPC (/24)
+    vpc=new ec2.Vpc(this,"wordpressVpc",{
+      cidr: vpcCidr,
+      maxAzs: 2,
+     
+      subnetConfiguration: [
+        {
+          name: 'Application',
+          cidrMask: 26,
+          subnetType: ec2.SubnetType.ISOLATED, //enabled Private access due to ECR requirement
+  //        subnetType: ec2.SubnetType.ISOLATED,
+          
+          
+          },
+    
+      {
+      name: 'Public',
+      cidrMask: 27,
+      subnetType: ec2.SubnetType.PUBLIC
+      
+      },
+        {
+          name: 'Data',
+          cidrMask: 28,
+          subnetType: ec2.SubnetType.ISOLATED
+          
+          
+        },
+      
+      ]
+      
+      });
+
+
+      const appsubnets = vpc.selectSubnets({
+        subnetGroupName:  "Application",
+        onePerAz: true,
+      });
+  
+    // Adding interface endpoints for ECR Api
+    const ecrIE = vpc.addInterfaceEndpoint('ECR', {
+      service: ec2.InterfaceVpcEndpointAwsService.ECR,
+      privateDnsEnabled: true,
+      subnets: appsubnets,
+    });
+    ecrIE.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(443), 'Allow from ECR IE Private SG');
+
+// Adding interface endpoints for ECR Docker (Required for Fargate 1.4.0 or later)
+    const ecrdkrIE = vpc.addInterfaceEndpoint('ECR-Docker', {
+      service: ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
+      privateDnsEnabled: true,
+      subnets: appsubnets,
+    });
+    ecrdkrIE.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(443), 'Allow from ECR IE Private SG');
+
+  
+
+  }
     
     //#########################################################################
     //# Section: VPC Endpoints                                                #
@@ -90,23 +156,7 @@ export class AwsCdkWordpressStack extends Stack {
 
     */
 
-    /*
-    // Adding interface endpoints for ECR Api
-    const ecrIE = vpc.addInterfaceEndpoint('ECR', {
-      service: ec2.InterfaceVpcEndpointAwsService.ECR,
-      privateDnsEnabled: true,
-      subnets: appsubnets,
-    });
-    ecrIE.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(443), 'Allow from ECR IE Private SG');
-
-// Adding interface endpoints for ECR Docker (Required for Fargate 1.4.0 or later)
-    const ecrdkrIE = vpc.addInterfaceEndpoint('ECR-Docker', {
-      service: ec2.InterfaceVpcEndpointAwsService.ECR_DOCKER,
-      privateDnsEnabled: true,
-      subnets: appsubnets,
-    });
-    ecrdkrIE.connections.allowFrom(ec2.Peer.ipv4(vpc.vpcCidrBlock), ec2.Port.tcp(443), 'Allow from ECR IE Private SG');
-*/
+   
     // Adding interface endpoints for AWS Secrets Manager
     const secretsIE = vpc.addInterfaceEndpoint('SecretsManager', {
       service: ec2.InterfaceVpcEndpointAwsService.SECRETS_MANAGER,
@@ -281,7 +331,16 @@ export class AwsCdkWordpressStack extends Stack {
       securityGroup:efssg
     });
 
- 
+    const efsaccesspoint = new efs.AccessPoint(this, 'containermount', {
+      fileSystem: efsvolume,
+      path:'/bitnami',
+      createAcl: {
+        ownerGid: '1000',
+        ownerUid: '1000',
+        permissions: '0777'
+        
+      }
+    })
 
 
      // Iterate the data subnets and place into an array
@@ -411,9 +470,17 @@ export class AwsCdkWordpressStack extends Stack {
     });
 
  
+    let imagesource: string;
+    if (props?.privateECR != undefined) {
+      imagesource=props?.privateECR
+    } else {
+      imagesource='public.ecr.aws/bitnami/wordpress:latest'
+    }
+
+
     const containerdef = new ecs.ContainerDefinition(this, 'wordpress-container', {
       taskDefinition: fargatetask,
-      image: ecs.ContainerImage.fromRegistry("public.ecr.aws/bitnami/wordpress:latest"),
+      image: ecs.ContainerImage.fromRegistry(imagesource),
       memoryLimitMiB:512,
       portMappings: [{
         containerPort: 8080,
@@ -443,7 +510,7 @@ export class AwsCdkWordpressStack extends Stack {
     });
 
       containerdef.addMountPoints({
-      containerPath: '/var/www/html',
+      containerPath: '/bitnami/wordpress',
       sourceVolume: 'wordpress-data',
       readOnly: false,
     });
